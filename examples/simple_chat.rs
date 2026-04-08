@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading model from: {}", model_path);
 
     // Create engine with CPU backend
-    let engine = Engine::new(model_path, Backend::Cpu)?;
+    let engine = Engine::new(model_path)?;
     println!("Engine created successfully!");
 
     // Create a session (conversation)

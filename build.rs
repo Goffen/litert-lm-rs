@@ -1,23 +1,45 @@
 use std::env;
 use std::path::PathBuf;
 
+/// Candidate directories that might contain a LiteRT-LM checkout.
+fn litert_lm_candidates(manifest: &PathBuf) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(d) = env::var("LITERT_LM_DIR") {
+        dirs.push(PathBuf::from(d));
+    }
+    if let Some(parent) = manifest.parent() {
+        for name in ["LiteRT-LM", "litert-lm"] {
+            dirs.push(parent.join(name));
+        }
+    }
+    dirs
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LITERT_LM_DIR");
     println!("cargo:rerun-if-env-changed=LITERT_LM_LIB_PATH");
 
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let manifest_path = PathBuf::from(&manifest_dir);
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    // ── Locate LiteRT-LM repo ───────────────────────────────────────────
+    let candidates = litert_lm_candidates(&manifest);
 
     // ── Header resolution ───────────────────────────────────────────────
-    let c_header = if manifest_path.join("c/engine.h").exists() {
-        manifest_path.join("c/engine.h")
-    } else {
-        manifest_path.parent().unwrap().join("c/engine.h")
-    };
-    if !c_header.exists() {
-        panic!("Could not find c/engine.h at: {}", c_header.display());
-    }
+    // Prefer the upstream header from the LiteRT-LM repo so it's always
+    // in sync with the built shared library.
+    let c_header = candidates
+        .iter()
+        .map(|d| d.join("c/engine.h"))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| {
+            panic!(
+                "Could not find c/engine.h in any LiteRT-LM checkout.\n\
+                 Searched: {:?}\n\
+                 Set LITERT_LM_DIR to the LiteRT-LM repo root.",
+                candidates
+            );
+        });
     println!("cargo:rerun-if-changed={}", c_header.display());
 
     // ── Bindgen ─────────────────────────────────────────────────────────
@@ -36,29 +58,18 @@ fn main() {
         .generate()
         .expect("Unable to generate bindings");
 
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("bindings.rs"))
-        .expect("Couldn't write bindings!");
+    PathBuf::from(env::var("OUT_DIR").unwrap())
+        .join("bindings.rs")
+        .pipe(|p| bindings.write_to_file(p).expect("Couldn't write bindings!"));
 
     // ── Locate libengine_shared.dylib ───────────────────────────────────
-    //
-    // Search order:
-    //   1. LITERT_LM_LIB_PATH  — explicit directory
-    //   2. LITERT_LM_DIR       — repo root, we look in bazel-bin/c/
-    //   3. Sibling directory    — ../LiteRT-LM/bazel-bin/c/
     let lib_name = "libengine_shared.dylib";
     let mut lib_dirs: Vec<PathBuf> = Vec::new();
     if let Ok(p) = env::var("LITERT_LM_LIB_PATH") {
         lib_dirs.push(PathBuf::from(p));
     }
-    if let Ok(d) = env::var("LITERT_LM_DIR") {
-        lib_dirs.push(PathBuf::from(d).join("bazel-bin/c"));
-    }
-    if let Some(parent) = manifest_path.parent() {
-        for name in ["LiteRT-LM", "litert-lm"] {
-            lib_dirs.push(parent.join(name).join("bazel-bin/c"));
-        }
+    for d in &candidates {
+        lib_dirs.push(d.join("bazel-bin/c"));
     }
 
     let mut found = false;
@@ -68,15 +79,11 @@ fn main() {
             let abs_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
             let abs_dylib = abs_dir.join(lib_name);
 
-            // Tell the linker where to find the library at build time.
             println!("cargo:rustc-link-search=native={}", abs_dir.display());
 
-            // Patch the dylib's install_name to its absolute path so that
-            // any binary linking against it — including downstream consumers
-            // — can load it at runtime without needing rpath or
-            // DYLD_LIBRARY_PATH.  (cargo:rustc-link-arg does NOT propagate
-            // from dependency build scripts to the final binary, so rpath
-            // is not a viable strategy for library crates.)
+            // Patch install_name to absolute path so downstream consumers
+            // find it without rpath (cargo:rustc-link-arg doesn't propagate
+            // from dependency build scripts).
             let _ = std::process::Command::new("chmod")
                 .args(["u+w", &dylib.to_string_lossy()])
                 .status();
@@ -92,12 +99,18 @@ fn main() {
         println!("cargo:warning=Could not find {lib_name}. Set LITERT_LM_DIR or LITERT_LM_LIB_PATH.");
     }
 
-    // Link the shared library.
     println!("cargo:rustc-link-lib=dylib=engine_shared");
 
-    // Link C++ standard library.
     #[cfg(target_os = "macos")]
     println!("cargo:rustc-link-lib=dylib=c++");
     #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=dylib=stdc++");
 }
+
+/// Extension trait to avoid a temporary variable for write_to_file.
+trait Pipe: Sized {
+    fn pipe(self, f: impl FnOnce(Self)) {
+        f(self)
+    }
+}
+impl Pipe for PathBuf {}

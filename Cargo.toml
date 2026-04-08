@@ -8,12 +8,12 @@ license = "Apache-2.0"
 repository = "https://github.com/maceip/litert-lm-rs"
 include = [
     "src/**/*",
-    "c/engine.h",
     "build.rs",
     "Cargo.toml",
     "README.md",
     "LICENSE",
     "examples/**/*",
+    "scripts/**/*",
 ]
 
 [lib]

@@ -1,38 +1,25 @@
 //! # LiteRT-LM Rust Bindings
 //!
-//! Safe, idiomatic Rust wrapper for the LiteRT-LM C API.
+//! Safe Rust wrapper for the [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) C API.
+//! Supports text generation, multi-turn conversations with tool calling,
+//! and multimodal input (images, audio).
 //!
-//! ## Features
-//!
-//! - **Safe API**: Memory-safe wrappers around C FFI
-//! - **Automatic cleanup**: RAII-based resource management
-//! - **Thread-safe**: Proper Send/Sync implementations
-//! - **Error handling**: Result-based error handling
-//!
-//! ## Example
+//! ## Quick start
 //!
 //! ```no_run
-//! use litert_lm::{Engine, Backend};
+//! use litert_lm::{Engine, Conversation};
 //!
-//! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create engine
-//!     let engine = Engine::new("model.tflite", Backend::Cpu)?;
-//!
-//!     // Create session
-//!     let session = engine.create_session()?;
-//!
-//!     // Generate text
-//!     let response = session.generate("Hello, how are you?")?;
-//!     println!("Response: {}", response);
-//!
-//!     Ok(())
-//! }
+//! let engine = Engine::new("model.litertlm")?;
+//! let mut convo = Conversation::new(&engine)?;
+//! let response = convo.send("What is 2 + 2?")?;
+//! println!("{}", response.text().unwrap_or_default());
+//! # Ok::<(), litert_lm::Error>(())
 //! ```
 
 use std::ffi::{CStr, CString};
 use std::fmt;
 
-// Include auto-generated bindings from bindgen
+// Auto-generated FFI bindings from bindgen.
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
@@ -48,12 +35,10 @@ use bindings::*;
 // Public Types
 // ============================================================================
 
-/// Backend type for model execution
+/// Backend type for model execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// CPU backend
     Cpu,
-    /// GPU backend (if available)
     Gpu,
 }
 
@@ -66,14 +51,14 @@ impl Backend {
     }
 }
 
-/// Error type for LiteRT-LM operations
+/// Error type for LiteRT-LM operations.
 #[derive(Debug, Clone)]
 pub struct Error {
     message: String,
 }
 
 impl Error {
-    fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Error {
             message: message.into(),
         }
@@ -82,71 +67,113 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LiteRT-LM Error: {}", self.message)
+        write!(f, "LiteRT-LM: {}", self.message)
     }
 }
 
 impl std::error::Error for Error {}
 
-/// Result type for LiteRT-LM operations
 pub type Result<T> = std::result::Result<T, Error>;
+
+// ============================================================================
+// Response
+// ============================================================================
+
+/// A response from the model, which may contain text, tool calls, or both.
+///
+/// The underlying data is JSON from the C API. Accessor methods extract
+/// specific fields without requiring a JSON library as a dependency.
+#[derive(Debug, Clone)]
+pub struct Response {
+    json: String,
+}
+
+impl Response {
+    /// Construct a Response, stripping Gemma's `<|"|>` string-quoting tokens
+    /// from tool-call arguments so callers get clean JSON.
+    fn new(raw_json: String) -> Self {
+        Response {
+            json: strip_gemma_quote_tokens(&raw_json),
+        }
+    }
+
+    /// The JSON string returned by the C API (with model artifacts cleaned).
+    ///
+    /// Typical shapes:
+    /// - Text: `{"role":"assistant","content":[{"type":"text","text":"..."}]}`
+    /// - Tool call: `{"tool_calls":[{"type":"function","function":{"name":"...","arguments":{...}}}]}`
+    pub fn json(&self) -> &str {
+        &self.json
+    }
+
+    /// Extract the model's text reply, if any.
+    ///
+    /// Returns `None` when the response is purely a tool call.
+    pub fn text(&self) -> Option<String> {
+        let text = extract_json_text_field(&self.json);
+        if text.is_empty() { None } else { Some(text) }
+    }
+
+    /// Whether the response contains one or more tool calls.
+    pub fn has_tool_calls(&self) -> bool {
+        self.json.contains("\"tool_calls\"")
+    }
+}
+
+impl fmt::Display for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.text() {
+            Some(t) => f.write_str(&t),
+            None => f.write_str(&self.json),
+        }
+    }
+}
 
 // ============================================================================
 // Engine
 // ============================================================================
 
-/// LiteRT-LM Engine - the main entry point for loading models
-///
-/// The Engine loads a model file and prepares it for inference.
-/// Create sessions from the engine to perform text generation.
+/// Loads a model and serves as factory for [`Session`] and [`Conversation`].
 pub struct Engine {
     raw: *mut LiteRtLmEngine,
-    _settings: *mut LiteRtLmEngineSettings, // Keep settings alive
+    _settings: *mut LiteRtLmEngineSettings,
 }
 
-// Safety: The C API allows engines to be shared between threads
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
 impl Engine {
-    /// Create a new Engine from a model file
+    /// Load a `.litertlm` model with GPU backend and vision support.
     ///
-    /// # Arguments
-    ///
-    /// * `model_path` - Path to the .tflite model file
-    /// * `backend` - Backend to use (Cpu or Gpu)
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use litert_lm::{Engine, Backend};
-    ///
-    /// let engine = Engine::new("model.tflite", Backend::Cpu)?;
-    /// # Ok::<(), litert_lm::Error>(())
-    /// ```
-    pub fn new(model_path: &str, backend: Backend) -> Result<Self> {
-        let model_path_cstr = CString::new(model_path)
-            .map_err(|e| Error::new(format!("Invalid model path: {}", e)))?;
+    /// Uses GPU for inference, CPU for vision encoding, and no audio backend.
+    /// This is the recommended default for multimodal models.
+    pub fn new(model_path: &str) -> Result<Self> {
+        Self::create(model_path, Backend::Gpu, Some(Backend::Cpu), None)
+    }
 
-        let backend_cstr = CString::new(backend.as_str())
-            .map_err(|e| Error::new(format!("Invalid backend string: {}", e)))?;
+    fn create(
+        model_path: &str,
+        backend: Backend,
+        vision_backend: Option<Backend>,
+        audio_backend: Option<Backend>,
+    ) -> Result<Self> {
+        let path = to_cstring(model_path, "model path")?;
+        let be = to_cstring(backend.as_str(), "backend")?;
+        let vis = vision_backend.map(|b| to_cstring(b.as_str(), "vision")).transpose()?;
+        let aud = audio_backend.map(|b| to_cstring(b.as_str(), "audio")).transpose()?;
 
         unsafe {
-            // Create engine settings
             let settings = litert_lm_engine_settings_create(
-                model_path_cstr.as_ptr(),
-                backend_cstr.as_ptr(),
-                std::ptr::null(), // vision_backend_str
-                std::ptr::null(), // audio_backend_str
+                path.as_ptr(),
+                be.as_ptr(),
+                vis.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                aud.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             );
-
             if settings.is_null() {
                 return Err(Error::new("Failed to create engine settings"));
             }
 
-            // Create engine
             let engine = litert_lm_engine_create(settings);
-
             if engine.is_null() {
                 litert_lm_engine_settings_delete(settings);
                 return Err(Error::new("Failed to create engine"));
@@ -159,28 +186,13 @@ impl Engine {
         }
     }
 
-    /// Create a new session for text generation
-    ///
-    /// Sessions maintain conversation history and state.
-    /// You can create multiple sessions from the same engine.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use litert_lm::{Engine, Backend};
-    ///
-    /// let engine = Engine::new("model.tflite", Backend::Cpu)?;
-    /// let session = engine.create_session()?;
-    /// # Ok::<(), litert_lm::Error>(())
-    /// ```
+    /// Create a low-level [`Session`] (raw text, no chat template).
     pub fn create_session(&self) -> Result<Session> {
         unsafe {
             let session = litert_lm_engine_create_session(self.raw, std::ptr::null_mut());
-
             if session.is_null() {
                 return Err(Error::new("Failed to create session"));
             }
-
             Ok(Session { raw: session })
         }
     }
@@ -196,64 +208,36 @@ impl Drop for Engine {
 }
 
 // ============================================================================
-// Session
+// Session (low-level, no template)
 // ============================================================================
 
-/// LiteRT-LM Session - represents a conversation context
+/// Low-level text generation without the chat template.
 ///
-/// A session maintains the conversation history and can generate
-/// text responses to prompts.
+/// Use [`Conversation`] instead for chat, tool calls, and multimodal input.
 pub struct Session {
     raw: *mut LiteRtLmSession,
 }
 
-// Safety: Sessions can be moved between threads but not shared
 unsafe impl Send for Session {}
 
 impl Session {
-    /// Generate text from a prompt
-    ///
-    /// # Arguments
-    ///
-    /// * `prompt` - The input text prompt
-    ///
-    /// # Returns
-    ///
-    /// The generated text response
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use litert_lm::{Engine, Backend};
-    ///
-    /// let engine = Engine::new("model.tflite", Backend::Cpu)?;
-    /// let session = engine.create_session()?;
-    /// let response = session.generate("What is 2+2?")?;
-    /// println!("Response: {}", response);
-    /// # Ok::<(), litert_lm::Error>(())
-    /// ```
+    /// Generate text from a raw prompt (no chat template applied).
     pub fn generate(&self, prompt: &str) -> Result<String> {
-        let prompt_cstr = CString::new(prompt)
-            .map_err(|e| Error::new(format!("Invalid prompt: {}", e)))?;
+        let prompt_cstr = to_cstring(prompt, "prompt")?;
 
         unsafe {
-            // Create InputData for text
             let input_data = InputData {
                 type_: InputDataType_kInputText,
                 data: prompt_cstr.as_ptr() as *const std::ffi::c_void,
                 size: prompt.len(),
             };
 
-            // Generate content
             let responses = litert_lm_session_generate_content(self.raw, &input_data, 1);
-
             if responses.is_null() {
                 return Err(Error::new("Failed to generate content"));
             }
 
-            // Get response text
             let text_ptr = litert_lm_responses_get_response_text_at(responses, 0);
-
             let result = if !text_ptr.is_null() {
                 CStr::from_ptr(text_ptr).to_string_lossy().into_owned()
             } else {
@@ -261,37 +245,24 @@ impl Session {
                 return Err(Error::new("No response generated"));
             };
 
-            // Clean up responses
             litert_lm_responses_delete(responses);
-
             Ok(result)
         }
     }
 
-    /// Get benchmark information (if benchmarking is enabled)
-    ///
-    /// Returns information about performance metrics like tokens per second.
+    /// Get benchmark info (only available if benchmarking was enabled).
     pub fn get_benchmark_info(&self) -> Result<BenchmarkInfo> {
         unsafe {
             let info = litert_lm_session_get_benchmark_info(self.raw);
-
             if info.is_null() {
                 return Err(Error::new("Failed to get benchmark info"));
             }
-
-            let time_to_first_token =
-                litert_lm_benchmark_info_get_time_to_first_token(info);
-            let num_prefill_turns = litert_lm_benchmark_info_get_num_prefill_turns(info);
-            let num_decode_turns = litert_lm_benchmark_info_get_num_decode_turns(info);
-
             let result = BenchmarkInfo {
-                time_to_first_token,
-                num_prefill_turns: num_prefill_turns as usize,
-                num_decode_turns: num_decode_turns as usize,
+                time_to_first_token: litert_lm_benchmark_info_get_time_to_first_token(info),
+                num_prefill_turns: litert_lm_benchmark_info_get_num_prefill_turns(info) as usize,
+                num_decode_turns: litert_lm_benchmark_info_get_num_decode_turns(info) as usize,
             };
-
             litert_lm_benchmark_info_delete(info);
-
             Ok(result)
         }
     }
@@ -299,22 +270,50 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        unsafe {
-            litert_lm_session_delete(self.raw);
-        }
+        unsafe { litert_lm_session_delete(self.raw) }
     }
 }
 
-
 // ============================================================================
-// Conversation
+// Conversation (high-level: chat template, tool calls, multimodal)
 // ============================================================================
 
-/// A multi-turn conversation context that applies the model's chat template.
+/// Multi-turn conversation with chat template, tool calling, and multimodal
+/// support.
 ///
-/// Unlike [`Session`], which sends raw text, `Conversation` wraps prompts in
-/// the model's Jinja chat template and correctly handles thinking channels,
-/// stop tokens, and tool calls. Use this for all chat-style interactions.
+/// # Tool calling
+///
+/// ```no_run
+/// # use litert_lm::*;
+/// # let engine = Engine::new("m.litertlm")?;
+/// let tools = r#"[{"name":"get_weather","description":"Get weather","parameters":{
+///     "type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}]"#;
+///
+/// let mut convo = Conversation::with_config(&engine, None, Some(tools))?;
+/// let resp = convo.send("What's the weather in Paris?")?;
+///
+/// if resp.has_tool_calls() {
+///     // Execute the tool, then send the result back:
+///     let tool_result = r#"[{"role":"tool","content":{"location":"Paris","temp":22}}]"#;
+///     let final_resp = convo.send_json(tool_result)?;
+///     println!("{}", final_resp.text().unwrap());
+/// }
+/// # Ok::<(), Error>(())
+/// ```
+///
+/// # Multimodal (audio/image)
+///
+/// ```no_run
+/// # use litert_lm::*;
+/// # let engine = Engine::new("m.litertlm")?;
+/// # let mut convo = Conversation::new(&engine)?;
+/// let msg = r#"{"role":"user","content":[
+///     {"type":"audio","path":"/tmp/recording.wav"},
+///     {"type":"text","text":"Describe this audio."}
+/// ]}"#;
+/// let resp = convo.send_json(msg)?;
+/// # Ok::<(), Error>(())
+/// ```
 pub struct Conversation {
     raw: *mut LiteRtLmConversation,
 }
@@ -322,25 +321,46 @@ pub struct Conversation {
 unsafe impl Send for Conversation {}
 
 impl Conversation {
-    /// Create a conversation from an engine with default config.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use litert_lm::{Engine, Backend, Conversation};
-    ///
-    /// let engine = Engine::new("model.litertlm", Backend::Gpu)?;
-    /// let mut convo = Conversation::new(&engine)?;
-    /// let reply = convo.send("What is 2 + 2?")?;
-    /// println!("{reply}");
-    /// # Ok::<(), litert_lm::Error>(())
-    /// ```
+    /// Create a conversation with default config (no tools, no system message).
     pub fn new(engine: &Engine) -> Result<Self> {
         unsafe {
-            // Pass NULL config so the C API calls
-            // ConversationConfig::CreateDefault(*engine) which properly
-            // initializes from the engine's metadata.
             let raw = litert_lm_conversation_create(engine.raw, std::ptr::null_mut());
+            if raw.is_null() {
+                return Err(Error::new("Failed to create conversation"));
+            }
+            Ok(Conversation { raw })
+        }
+    }
+
+    /// Create a conversation with optional system message and tool declarations.
+    ///
+    /// - `system_message`: plain text system prompt (e.g. `"You are a helpful assistant."`)
+    /// - `tools_json`: JSON array of tool declarations (see [tool-use docs])
+    ///
+    /// [tool-use docs]: https://github.com/google-ai-edge/LiteRT-LM/blob/main/docs/api/cpp/tool-use.md
+    pub fn with_config(
+        engine: &Engine,
+        system_message: Option<&str>,
+        tools_json: Option<&str>,
+    ) -> Result<Self> {
+        let sys_cstr = system_message.map(|s| to_cstring(s, "system_message")).transpose()?;
+        let tools_cstr = tools_json.map(|s| to_cstring(s, "tools_json")).transpose()?;
+
+        unsafe {
+            let config = litert_lm_conversation_config_create(
+                engine.raw,
+                std::ptr::null(),                                        // session_config
+                sys_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                tools_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                std::ptr::null(),                                        // messages_json
+                tools_json.is_some(),                                    // enable constrained decoding when tools present
+            );
+            if config.is_null() {
+                return Err(Error::new("Failed to create conversation config"));
+            }
+
+            let raw = litert_lm_conversation_create(engine.raw, config);
+            litert_lm_conversation_config_delete(config);
 
             if raw.is_null() {
                 return Err(Error::new("Failed to create conversation"));
@@ -349,58 +369,90 @@ impl Conversation {
         }
     }
 
-    /// Send a plain-text message and get the model's response.
+    /// Send a plain-text user message.
     ///
-    /// The message is automatically wrapped in the model's chat template.
-    /// Returns the model's text response with thinking content stripped.
-    pub fn send(&mut self, message: &str) -> Result<String> {
-        // The C API expects a JSON object: {"role": "user", "content": "..."}.
-        let content_escaped = serde_json_mini_encode(message);
-        let message_json = format!(
-            r#"{{"role":"user","content":{content_escaped}}}"#
-        );
-        let message_cstr = CString::new(message_json)
-            .map_err(|e| Error::new(format!("Invalid message: {}", e)))?;
+    /// The message is automatically wrapped in `{"role":"user","content":"..."}`.
+    pub fn send(&mut self, message: &str) -> Result<Response> {
+        let escaped = json_encode_string(message);
+        let json = format!(r#"{{"role":"user","content":{escaped}}}"#);
+        self.send_raw_json(&json)
+    }
+
+    /// Send a raw JSON message.
+    ///
+    /// Use this for:
+    /// - **Tool responses**: `[{"role":"tool","content":{...}}]`
+    /// - **Multimodal input**: `{"role":"user","content":[{"type":"image","path":"..."},{"type":"text","text":"..."}]}`
+    /// - **Audio input**: `{"role":"user","content":[{"type":"audio","path":"..."},{"type":"text","text":"..."}]}`
+    ///
+    /// The JSON is passed directly to the C API without modification.
+    pub fn send_json(&mut self, json: &str) -> Result<Response> {
+        self.send_raw_json(json)
+    }
+
+    fn send_raw_json(&mut self, json: &str) -> Result<Response> {
+        let cstr = to_cstring(json, "message json")?;
 
         unsafe {
-            let response = litert_lm_conversation_send_message(
+            let resp = litert_lm_conversation_send_message(
                 self.raw,
-                message_cstr.as_ptr(),
-                std::ptr::null(), // no extra context
+                cstr.as_ptr(),
+                std::ptr::null(),
             );
-
-            if response.is_null() {
+            if resp.is_null() {
                 return Err(Error::new("Failed to send message"));
             }
 
-            let json_ptr = litert_lm_json_response_get_string(response);
+            let json_ptr = litert_lm_json_response_get_string(resp);
             let result = if !json_ptr.is_null() {
-                let raw = CStr::from_ptr(json_ptr).to_string_lossy();
-                // Response is JSON: {"role":"assistant","content":[{"type":"text","text":"..."}]}
-                // Extract the text field from the first content item.
-                extract_response_text(&raw)
+                CStr::from_ptr(json_ptr).to_string_lossy().into_owned()
             } else {
-                litert_lm_json_response_delete(response);
+                litert_lm_json_response_delete(resp);
                 return Err(Error::new("No response from conversation"));
             };
 
-            litert_lm_json_response_delete(response);
-            Ok(result)
+            litert_lm_json_response_delete(resp);
+            Ok(Response::new(result))
         }
     }
 }
 
 impl Drop for Conversation {
     fn drop(&mut self) {
-        unsafe {
-            litert_lm_conversation_delete(self.raw);
-        }
+        unsafe { litert_lm_conversation_delete(self.raw) }
     }
 }
 
-/// Minimal JSON string encoding (no serde dependency needed).
-/// Wraps `s` in double quotes, escaping \ " and control characters.
-fn serde_json_mini_encode(s: &str) -> String {
+// ============================================================================
+// BenchmarkInfo
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkInfo {
+    pub time_to_first_token: f64,
+    pub num_prefill_turns: usize,
+    pub num_decode_turns: usize,
+}
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn to_cstring(s: &str, label: &str) -> Result<CString> {
+    CString::new(s).map_err(|e| Error::new(format!("Invalid {label}: {e}")))
+}
+
+/// Strip Gemma 4's `<|"|>` string-quoting tokens from a JSON response.
+///
+/// The model wraps tool-call string arguments in `<|"|>...<|"|>` tokens.
+/// Inside JSON these appear as `<|\\\"|>` (escaped quote). We strip both
+/// the escaped and unescaped forms so callers get plain values.
+fn strip_gemma_quote_tokens(json: &str) -> String {
+    json.replace("<|\\\"|>", "").replace("<|\"|>", "")
+}
+
+/// Encode a Rust string as a JSON string literal (with surrounding quotes).
+fn json_encode_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -410,9 +462,7 @@ fn serde_json_mini_encode(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c < '\x20' => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
+            c if c < '\x20' => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -420,21 +470,17 @@ fn serde_json_mini_encode(s: &str) -> String {
     out
 }
 
-/// Extract the assistant's text from a conversation JSON response.
-/// Expected format: {"role":"assistant","content":[{"type":"text","text":"..."}]}
-/// Falls back to returning the raw string if parsing fails.
-fn extract_response_text(json: &str) -> String {
-    // Minimal JSON extraction without pulling in serde_json:
-    // Find the last "text":" and extract its value.
+/// Extract the `"text"` value from the last `{"type":"text","text":"..."}` in a
+/// JSON response. Minimal parser — avoids a serde_json dependency.
+fn extract_json_text_field(json: &str) -> String {
     if let Some(pos) = json.rfind("\"text\":\"") {
         let start = pos + "\"text\":\"".len();
         let rest = &json[start..];
-        // Find the closing quote, handling escaped quotes.
         let mut end = 0;
         let bytes = rest.as_bytes();
         while end < bytes.len() {
             if bytes[end] == b'\\' {
-                end += 2; // skip escaped char
+                end += 2;
             } else if bytes[end] == b'"' {
                 break;
             } else {
@@ -442,7 +488,6 @@ fn extract_response_text(json: &str) -> String {
             }
         }
         let escaped = &rest[..end];
-        // Unescape basic JSON sequences.
         return escaped
             .replace("\\n", "\n")
             .replace("\\r", "\r")
@@ -450,22 +495,7 @@ fn extract_response_text(json: &str) -> String {
             .replace("\\\"", "\"")
             .replace("\\\\", "\\");
     }
-    // Fallback: return as-is.
-    json.to_string()
-}
-// ============================================================================
-// Benchmark Info
-// ============================================================================
-
-/// Benchmark information for a session
-#[derive(Debug, Clone)]
-pub struct BenchmarkInfo {
-    /// Time to first token in seconds
-    pub time_to_first_token: f64,
-    /// Number of prefill turns
-    pub num_prefill_turns: usize,
-    /// Number of decode turns
-    pub num_decode_turns: usize,
+    String::new()
 }
 
 // ============================================================================
@@ -485,6 +515,46 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = Error::new("test error");
-        assert_eq!(format!("{}", err), "LiteRT-LM Error: test error");
+        assert_eq!(format!("{}", err), "LiteRT-LM: test error");
+    }
+
+    #[test]
+    fn test_json_encode_string() {
+        assert_eq!(json_encode_string("hello"), "\"hello\"");
+        assert_eq!(json_encode_string("a\"b"), "\"a\\\"b\"");
+        assert_eq!(json_encode_string("line\nnext"), "\"line\\nnext\"");
+    }
+
+    #[test]
+    fn test_extract_text_field() {
+        let json = r#"{"role":"assistant","content":[{"type":"text","text":"2 + 2 is **4**."}]}"#;
+        assert_eq!(extract_json_text_field(json), "2 + 2 is **4**.");
+    }
+
+    #[test]
+    fn test_extract_text_empty_on_tool_call() {
+        let json = r#"{"tool_calls":[{"type":"function","function":{"name":"get_weather"}}]}"#;
+        assert_eq!(extract_json_text_field(json), "");
+    }
+
+    #[test]
+    fn test_response_has_tool_calls() {
+        let r = Response::new(r#"{"tool_calls":[{"type":"function"}]}"#.into());
+        assert!(r.has_tool_calls());
+        assert!(r.text().is_none());
+
+        let r2 = Response::new(r#"{"content":[{"type":"text","text":"hello"}]}"#.into());
+        assert!(!r2.has_tool_calls());
+        assert_eq!(r2.text().unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_gemma_quote_tokens_stripped() {
+        // The C API returns tool-call string args wrapped in <|\"|>...<|\"|>
+        // (the \" is an escaped quote inside JSON string values).
+        let raw = r#"{"tool_calls":[{"function":{"name":"search","arguments":{"query":"<|\"|>hello<|\"|>"}}}]}"#;
+        let r = Response::new(raw.into());
+        assert!(r.json().contains(r#""query":"hello""#), "got: {}", r.json());
+        assert!(!r.json().contains("<|"), "tokens not stripped: {}", r.json());
     }
 }

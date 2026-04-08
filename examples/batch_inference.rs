@@ -8,9 +8,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let model_path = &args[1];
 
-    println!("Loading model from: {}", model_path);
+    println!("Loading model from: {model_path}");
 
-    let engine = Engine::new(model_path, Backend::Gpu)?;
+    let engine = Engine::new(model_path)?;
     println!("Engine created successfully!\n");
 
     let prompts = vec![
@@ -23,24 +23,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("========================================");
 
     for (i, prompt) in prompts.iter().enumerate() {
-        println!("\n[{}] Prompt: {}", i + 1, prompt);
+        println!("\n[{}] Prompt: {prompt}", i + 1);
 
-        // Each prompt gets a fresh conversation (no shared history).
         let mut convo = Conversation::new(&engine)?;
-
         match convo.send(prompt) {
-            Ok(response) => {
-                println!("Response: {}", response);
-            }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-            }
+            Ok(resp) => println!("Response: {resp}"),
+            Err(e) => eprintln!("Error: {e}"),
         }
 
         println!("----------------------------------------");
     }
 
     println!("\nBatch inference complete!");
-
     Ok(())
 }
