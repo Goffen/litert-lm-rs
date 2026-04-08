@@ -136,6 +136,8 @@ impl Engine {
             let settings = litert_lm_engine_settings_create(
                 model_path_cstr.as_ptr(),
                 backend_cstr.as_ptr(),
+                std::ptr::null(), // vision_backend_str
+                std::ptr::null(), // audio_backend_str
             );
 
             if settings.is_null() {
@@ -173,7 +175,7 @@ impl Engine {
     /// ```
     pub fn create_session(&self) -> Result<Session> {
         unsafe {
-            let session = litert_lm_engine_create_session(self.raw);
+            let session = litert_lm_engine_create_session(self.raw, std::ptr::null_mut());
 
             if session.is_null() {
                 return Err(Error::new("Failed to create session"));
@@ -303,6 +305,154 @@ impl Drop for Session {
     }
 }
 
+
+// ============================================================================
+// Conversation
+// ============================================================================
+
+/// A multi-turn conversation context that applies the model's chat template.
+///
+/// Unlike [`Session`], which sends raw text, `Conversation` wraps prompts in
+/// the model's Jinja chat template and correctly handles thinking channels,
+/// stop tokens, and tool calls. Use this for all chat-style interactions.
+pub struct Conversation {
+    raw: *mut LiteRtLmConversation,
+}
+
+unsafe impl Send for Conversation {}
+
+impl Conversation {
+    /// Create a conversation from an engine with default config.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use litert_lm::{Engine, Backend, Conversation};
+    ///
+    /// let engine = Engine::new("model.litertlm", Backend::Gpu)?;
+    /// let mut convo = Conversation::new(&engine)?;
+    /// let reply = convo.send("What is 2 + 2?")?;
+    /// println!("{reply}");
+    /// # Ok::<(), litert_lm::Error>(())
+    /// ```
+    pub fn new(engine: &Engine) -> Result<Self> {
+        unsafe {
+            // Pass NULL config so the C API calls
+            // ConversationConfig::CreateDefault(*engine) which properly
+            // initializes from the engine's metadata.
+            let raw = litert_lm_conversation_create(engine.raw, std::ptr::null_mut());
+
+            if raw.is_null() {
+                return Err(Error::new("Failed to create conversation"));
+            }
+            Ok(Conversation { raw })
+        }
+    }
+
+    /// Send a plain-text message and get the model's response.
+    ///
+    /// The message is automatically wrapped in the model's chat template.
+    /// Returns the model's text response with thinking content stripped.
+    pub fn send(&mut self, message: &str) -> Result<String> {
+        // The C API expects a JSON object: {"role": "user", "content": "..."}.
+        let content_escaped = serde_json_mini_encode(message);
+        let message_json = format!(
+            r#"{{"role":"user","content":{content_escaped}}}"#
+        );
+        let message_cstr = CString::new(message_json)
+            .map_err(|e| Error::new(format!("Invalid message: {}", e)))?;
+
+        unsafe {
+            let response = litert_lm_conversation_send_message(
+                self.raw,
+                message_cstr.as_ptr(),
+                std::ptr::null(), // no extra context
+            );
+
+            if response.is_null() {
+                return Err(Error::new("Failed to send message"));
+            }
+
+            let json_ptr = litert_lm_json_response_get_string(response);
+            let result = if !json_ptr.is_null() {
+                let raw = CStr::from_ptr(json_ptr).to_string_lossy();
+                // Response is JSON: {"role":"assistant","content":[{"type":"text","text":"..."}]}
+                // Extract the text field from the first content item.
+                extract_response_text(&raw)
+            } else {
+                litert_lm_json_response_delete(response);
+                return Err(Error::new("No response from conversation"));
+            };
+
+            litert_lm_json_response_delete(response);
+            Ok(result)
+        }
+    }
+}
+
+impl Drop for Conversation {
+    fn drop(&mut self) {
+        unsafe {
+            litert_lm_conversation_delete(self.raw);
+        }
+    }
+}
+
+/// Minimal JSON string encoding (no serde dependency needed).
+/// Wraps `s` in double quotes, escaping \ " and control characters.
+fn serde_json_mini_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < '\x20' => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Extract the assistant's text from a conversation JSON response.
+/// Expected format: {"role":"assistant","content":[{"type":"text","text":"..."}]}
+/// Falls back to returning the raw string if parsing fails.
+fn extract_response_text(json: &str) -> String {
+    // Minimal JSON extraction without pulling in serde_json:
+    // Find the last "text":" and extract its value.
+    if let Some(pos) = json.rfind("\"text\":\"") {
+        let start = pos + "\"text\":\"".len();
+        let rest = &json[start..];
+        // Find the closing quote, handling escaped quotes.
+        let mut end = 0;
+        let bytes = rest.as_bytes();
+        while end < bytes.len() {
+            if bytes[end] == b'\\' {
+                end += 2; // skip escaped char
+            } else if bytes[end] == b'"' {
+                break;
+            } else {
+                end += 1;
+            }
+        }
+        let escaped = &rest[..end];
+        // Unescape basic JSON sequences.
+        return escaped
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+    }
+    // Fallback: return as-is.
+    json.to_string()
+}
 // ============================================================================
 // Benchmark Info
 // ============================================================================

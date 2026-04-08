@@ -1,299 +1,115 @@
 # litert-lm-rs
 
-Safe, idiomatic Rust bindings for the [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) C API.
+Rust bindings for [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) -- Google's on-device LLM runtime.
 
-## Quick Start
+## Prerequisites
+
+### 1. Build the shared library
 
 ```bash
-# 1. Clone and build LiteRT-LM C library
 git clone https://github.com/google-ai-edge/LiteRT-LM
 cd LiteRT-LM
-bazel build //c:engine
-
-# 2. Clone this repo
-cd ..
-git clone https://github.com/maceip/litert-lm-rs
-cd litert-lm-rs
-
-# 3. Build and run example
-export LD_LIBRARY_PATH=../LiteRT-LM/bazel-bin/c:$LD_LIBRARY_PATH
-cargo run --example simple_chat model.tflite
+git lfs pull                          # fetch prebuilt GPU dylibs
+bazel build //c:libengine_shared.dylib
 ```
 
-## About
+> The target is a `cc_binary(linkshared=True)`, not `cc_shared_library`.
+> `cc_shared_library` does not transitively link Rust static libraries
+> (the Jinja template engine is Rust via CXX bridge), leaving symbols
+> unresolved at runtime.
 
-LiteRT-LM is Google's lightweight runtime for on-device large language models. This crate provides Rust bindings that allow you to use LiteRT-LM from Rust applications with a safe, ergonomic API.
-
-**Upstream Repository**: https://github.com/google-ai-edge/LiteRT-LM
-
-## Use Cases
-
-- **On-device AI applications**: Run language models locally without cloud dependencies
-- **Privacy-focused apps**: Keep user data on-device with local inference
-- **Embedded systems**: Deploy LLMs on resource-constrained devices
-- **Rust applications**: Integrate LiteRT-LM into Rust-based services and tools
-- **Cross-platform development**: Build portable AI applications for Linux and macOS
-
-## Interfaces
-
-### Engine
-
-The primary interface for loading and managing a language model. An `Engine` owns the loaded model and can create multiple sessions.
-
-**API**:
-- `Engine::new(model_path, backend)` - Load a .tflite model file with CPU or GPU backend
-- `engine.create_session()` - Create a new conversation session
-
-**Use when**: You need to load a model once and create multiple independent conversation contexts.
-
-### Session
-
-Represents a stateful conversation context. Each session maintains its own history and can generate text responses.
-
-**API**:
-- `session.generate(prompt)` - Generate text from a prompt
-- `session.get_benchmark_info()` - Get performance metrics
-
-**Use when**: You need to maintain conversation history or generate multiple related responses.
-
-### Backend
-
-Specifies the hardware backend for model execution.
-
-**Options**:
-- `Backend::Cpu` - CPU-based inference
-- `Backend::Gpu` - GPU-accelerated inference (if available)
-
-## Features
-
-- **Automatic FFI generation**: Uses `bindgen` to auto-generate bindings from `c/engine.h`
-- **Safe API**: Memory-safe Rust wrappers around C FFI
-- **Thread-safe**: Engine and Session types implement Send/Sync where appropriate
-- **Idiomatic Rust**: Result-based error handling, RAII resource management
-- **Portable**: Works on Linux and macOS with simple build process
-- **Zero maintenance**: Bindings stay in sync with C API automatically
-
-## Building
-
-### Prerequisites
-
-This crate requires the LiteRT-LM C library to be built first.
-
-1. **Clone LiteRT-LM**:
-   ```bash
-   git clone https://github.com/google-ai-edge/LiteRT-LM
-   cd LiteRT-LM
-   ```
-
-2. **Build the C API library**:
-   ```bash
-   bazel build //c:engine
-   ```
-
-   This creates:
-   - `bazel-bin/c/libengine.so` (Linux)
-   - `bazel-bin/c/libengine.dylib` (macOS)
-
-### Build the Rust bindings
+### 2. Download a model
 
 ```bash
-cargo build --release
-```
-
-The build script will automatically:
-- Run `bindgen` to generate FFI bindings from `c/engine.h`
-- Link against `bazel-bin/c/libengine.so`
-
-### Runtime library path
-
-When running your application, ensure the dynamic linker can find `libengine.so`:
-
-```bash
-export LD_LIBRARY_PATH=/path/to/LiteRT-LM/bazel-bin/c:$LD_LIBRARY_PATH
-```
-
-Or build with rpath:
-```bash
-RUSTFLAGS="-C link-args=-Wl,-rpath,/path/to/LiteRT-LM/bazel-bin/c" cargo build
+./scripts/download-model.sh
+# defaults to litert-community/gemma-4-E2B-it-litert-lm
+# caches to ~/.litert-lm/models/
 ```
 
 ## Usage
 
-### Basic example
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+litert-lm-rs = { path = "../litert-lm-rs" }
+```
+
+`build.rs` automatically locates `libengine_shared.dylib` in a sibling
+`LiteRT-LM/` checkout, or via `LITERT_LM_DIR` / `LITERT_LM_LIB_PATH`
+environment variables. It patches the dylib's `install_name` to an
+absolute path so downstream binaries find it without rpath.
+
+### Conversation API (recommended)
+
+Applies the model's chat template; handles thinking channels and stop tokens
+correctly. Short factual answers work.
 
 ```rust
-use litert_lm::{Engine, Backend};
+use litert_lm::{Engine, Backend, Conversation};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load model
-    let engine = Engine::new("model.tflite", Backend::Cpu)?;
+    let engine = Engine::new(
+        &std::env::var("HOME")
+            .map(|h| format!("{h}/.litert-lm/models/litert-community--gemma-4-E2B-it-litert-lm/gemma-4-E2B-it.litertlm"))?,
+        Backend::Gpu,
+    )?;
 
-    // Create conversation session
-    let session = engine.create_session()?;
-
-    // Generate text
-    let response = session.generate("Hello, how are you?")?;
-    println!("Response: {}", response);
+    let mut convo = Conversation::new(&engine)?;
+    let reply = convo.send("What is 2 + 2?")?;
+    println!("{reply}");
+    // => "2 + 2 is **4**."
 
     Ok(())
 }
 ```
 
-### Interactive chat example
+### Session API (low-level)
 
-```rust
-use litert_lm::{Engine, Backend};
-use std::io::{self, Write};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::new("model.tflite", Backend::Cpu)?;
-    let session = engine.create_session()?;
-
-    loop {
-        print!("You: ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-
-        if input.trim().eq_ignore_ascii_case("quit") {
-            break;
-        }
-
-        match session.generate(input.trim()) {
-            Ok(response) => println!("Assistant: {}", response),
-            Err(e) => eprintln!("Error: {}", e),
-        }
-    }
-
-    Ok(())
-}
-```
-
-### Running examples
-
-```bash
-# Simple interactive chat
-cargo run --example simple_chat -- /path/to/model.tflite
-
-# Batch inference
-cargo run --example batch_inference -- /path/to/model.tflite
-```
-
-## API Overview
-
-### Engine
-
-The `Engine` is the main entry point for loading and managing a language model.
-
-```rust
-let engine = Engine::new("model.tflite", Backend::Cpu)?;
-```
-
-**Methods:**
-- `new(model_path: &str, backend: Backend) -> Result<Engine>` - Create engine from model file
-- `create_session(&self) -> Result<Session>` - Create a new conversation session
-
-### Session
-
-A `Session` represents a conversation context with history.
+Sends raw text without the chat template. Works for open-ended prompts;
+short factual questions may return empty strings.
 
 ```rust
 let session = engine.create_session()?;
-let response = session.generate("Hello!")?;
+let response = session.generate("Write a haiku about Rust.")?;
 ```
 
-**Methods:**
-- `generate(&self, prompt: &str) -> Result<String>` - Generate response to prompt
-- `get_benchmark_info(&self) -> Result<BenchmarkInfo>` - Get performance metrics
+## GPU support
 
-### Backend
+The engine runs on GPU by default (`Backend::Gpu`). The GPU accelerator
+and sampler are loaded dynamically at runtime from the prebuilt dylibs in
+`LiteRT-LM/prebuilt/macos_arm64/`. Set `DYLD_LIBRARY_PATH` so `dlopen`
+can find them:
 
-```rust
-pub enum Backend {
-    Cpu,  // CPU backend
-    Gpu,  // GPU backend (if available)
-}
-```
-
-### Error Handling
-
-All operations return `Result<T, Error>` for proper error handling:
-
-```rust
-match session.generate("prompt") {
-    Ok(response) => println!("Success: {}", response),
-    Err(e) => eprintln!("Error: {}", e),
-}
-```
-
-## Memory Management
-
-The wrapper uses RAII (Resource Acquisition Is Initialization) for automatic cleanup:
-
-- `Engine` automatically calls `litert_lm_engine_delete` on drop
-- `Session` automatically calls `litert_lm_session_delete` on drop
-- Generated strings are automatically freed
-
-No manual memory management required.
-
-## Thread Safety
-
-- `Engine`: Implements `Send + Sync` - can be shared between threads
-- `Session`: Implements `Send` - can be moved between threads, but not shared
-
-## Build Process Details
-
-The build process is designed to be simple and portable:
-
-1. **`build.rs` runs bindgen**:
-   - Reads `c/engine.h` from LiteRT-LM
-   - Generates Rust FFI bindings
-   - Writes to `$OUT_DIR/bindings.rs`
-
-2. **Links against minimal dependencies**:
-   - `libengine.so` (or `.dylib` on macOS)
-   - C++ standard library (`stdc++` on Linux, `c++` on macOS)
-   - No need to manually link dozens of libraries
-
-3. **Your code uses the safe wrapper**:
-   - `src/lib.rs` provides safe Rust API
-   - Automatically includes generated bindings
-   - Users never see unsafe code
-
-## Troubleshooting
-
-### "cannot find -lengine"
-
-The C API library is not in your library path.
-
-**Solution**: Build the C library first:
 ```bash
-cd /path/to/LiteRT-LM
-bazel build //c:engine
+export DYLD_LIBRARY_PATH=/path/to/LiteRT-LM/prebuilt/macos_arm64
+cargo run --bin myapp
 ```
 
-### "cannot find libengine.so at runtime"
+`libengine_shared.dylib` itself does **not** need `DYLD_LIBRARY_PATH` --
+`build.rs` patches its `install_name` to an absolute path.
 
-At runtime, the dynamic linker can't find the library.
+## API
 
-**Solution**: Set `LD_LIBRARY_PATH`:
+| Type           | Purpose                                                            |
+| -------------- | ------------------------------------------------------------------ |
+| `Engine`       | Loads a `.litertlm` model. Create one, share across conversations. |
+| `Conversation` | Multi-turn chat with template formatting. Use `send(&str)`.        |
+| `Session`      | Low-level single-turn generation. Use `generate(&str)`.            |
+| `Backend`      | `Cpu` or `Gpu`.                                                    |
+
+## Running examples
+
 ```bash
-export LD_LIBRARY_PATH=/path/to/LiteRT-LM/bazel-bin/c:$LD_LIBRARY_PATH
-```
+# Batch inference (Conversation API)
+DYLD_LIBRARY_PATH=/path/to/LiteRT-LM/prebuilt/macos_arm64 \
+  cargo run --example batch_inference /path/to/model.litertlm
 
-Or build with rpath:
-```bash
-RUSTFLAGS="-C link-args=-Wl,-rpath,/path/to/bazel-bin/c" cargo build
+# Interactive chat
+DYLD_LIBRARY_PATH=/path/to/LiteRT-LM/prebuilt/macos_arm64 \
+  cargo run --example simple_chat /path/to/model.litertlm
 ```
 
 ## License
 
 Apache-2.0
-
-## Contributing
-
-Contributions welcome! Please ensure:
-- Code follows Rust conventions (`cargo fmt`)
-- All tests pass (`cargo test`)
-- New features include tests and documentation
