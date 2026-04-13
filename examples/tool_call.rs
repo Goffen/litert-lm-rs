@@ -1,4 +1,4 @@
-use litert_lm::{Backend, Conversation, Engine};
+use litert_lm::{Conversation, Engine};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();

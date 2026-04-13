@@ -1,4 +1,4 @@
-use litert_lm::{Backend, Engine};
+use litert_lm::Engine;
 use std::io::{self, Write};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

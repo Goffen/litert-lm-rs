@@ -111,7 +111,11 @@ impl Response {
     /// Returns `None` when the response is purely a tool call.
     pub fn text(&self) -> Option<String> {
         let text = extract_json_text_field(&self.json);
-        if text.is_empty() { None } else { Some(text) }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// Whether the response contains one or more tool calls.
@@ -148,7 +152,14 @@ impl Engine {
     /// Uses GPU for inference, CPU for vision encoding, and no audio backend.
     /// This is the recommended default for multimodal models.
     pub fn new(model_path: &str) -> Result<Self> {
-        Self::create(model_path, Backend::Gpu, Some(Backend::Cpu), None)
+        let dyld_path = std::env::var("DYLD_LIBRARY_PATH");
+
+        let backend = if dyld_path.is_ok() {
+            Backend::Gpu
+        } else {
+            Backend::Cpu
+        };
+        Self::create(model_path, backend, Some(Backend::Cpu), None)
     }
 
     fn create(
@@ -159,8 +170,12 @@ impl Engine {
     ) -> Result<Self> {
         let path = to_cstring(model_path, "model path")?;
         let be = to_cstring(backend.as_str(), "backend")?;
-        let vis = vision_backend.map(|b| to_cstring(b.as_str(), "vision")).transpose()?;
-        let aud = audio_backend.map(|b| to_cstring(b.as_str(), "audio")).transpose()?;
+        let vis = vision_backend
+            .map(|b| to_cstring(b.as_str(), "vision"))
+            .transpose()?;
+        let aud = audio_backend
+            .map(|b| to_cstring(b.as_str(), "audio"))
+            .transpose()?;
 
         unsafe {
             let settings = litert_lm_engine_settings_create(
@@ -343,17 +358,21 @@ impl Conversation {
         system_message: Option<&str>,
         tools_json: Option<&str>,
     ) -> Result<Self> {
-        let sys_cstr = system_message.map(|s| to_cstring(s, "system_message")).transpose()?;
-        let tools_cstr = tools_json.map(|s| to_cstring(s, "tools_json")).transpose()?;
+        let sys_cstr = system_message
+            .map(|s| to_cstring(s, "system_message"))
+            .transpose()?;
+        let tools_cstr = tools_json
+            .map(|s| to_cstring(s, "tools_json"))
+            .transpose()?;
 
         unsafe {
             let config = litert_lm_conversation_config_create(
                 engine.raw,
-                std::ptr::null(),                                        // session_config
+                std::ptr::null(), // session_config
                 sys_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
                 tools_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-                std::ptr::null(),                                        // messages_json
-                tools_json.is_some(),                                    // enable constrained decoding when tools present
+                std::ptr::null(),     // messages_json
+                tools_json.is_some(), // enable constrained decoding when tools present
             );
             if config.is_null() {
                 return Err(Error::new("Failed to create conversation config"));
@@ -394,11 +413,8 @@ impl Conversation {
         let cstr = to_cstring(json, "message json")?;
 
         unsafe {
-            let resp = litert_lm_conversation_send_message(
-                self.raw,
-                cstr.as_ptr(),
-                std::ptr::null(),
-            );
+            let resp =
+                litert_lm_conversation_send_message(self.raw, cstr.as_ptr(), std::ptr::null());
             if resp.is_null() {
                 return Err(Error::new("Failed to send message"));
             }
@@ -555,6 +571,10 @@ mod tests {
         let raw = r#"{"tool_calls":[{"function":{"name":"search","arguments":{"query":"<|\"|>hello<|\"|>"}}}]}"#;
         let r = Response::new(raw.into());
         assert!(r.json().contains(r#""query":"hello""#), "got: {}", r.json());
-        assert!(!r.json().contains("<|"), "tokens not stripped: {}", r.json());
+        assert!(
+            !r.json().contains("<|"),
+            "tokens not stripped: {}",
+            r.json()
+        );
     }
 }

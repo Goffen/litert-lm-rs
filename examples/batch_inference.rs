@@ -1,4 +1,4 @@
-use litert_lm::{Backend, Conversation, Engine};
+use litert_lm::{Conversation, Engine};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::new(model_path)?;
     println!("Engine created successfully!\n");
 
-    let prompts = vec![
+    let prompts = [
         "What is the capital of France?",
         "Write a haiku about programming.",
         "What is 2 + 2?",

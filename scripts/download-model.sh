@@ -6,14 +6,14 @@ set -euo pipefail
 # Usage:
 #   ./scripts/download-model.sh [REPO_ID] [FILENAME]
 #
-# Defaults to gemma-4-E2B-it-litert-lm if no arguments given.
+# Defaults to gemma-4-E4B-it-litert-lm if no arguments given.
 #
 # Environment:
 #   LITERT_LM_CACHE_DIR  Override cache directory (default: ~/.litert-lm/models)
 #   HF_TOKEN             HuggingFace auth token for gated models
 
-REPO_ID="${1:-litert-community/gemma-4-E2B-it-litert-lm}"
-FILENAME="${2:-gemma-4-E2B-it.litertlm}"
+REPO_ID="${1:-litert-community/gemma-4-E4B-it-litert-lm}"
+FILENAME="${2:-gemma-4-E4B-it.litertlm}"
 CACHE_DIR="${LITERT_LM_CACHE_DIR:-$HOME/.litert-lm/models}"
 
 # Convert repo_id to directory name: org/repo -> org--repo
