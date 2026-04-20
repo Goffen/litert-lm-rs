@@ -10,7 +10,7 @@ Rust bindings for [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) -- Go
 git clone https://github.com/google-ai-edge/LiteRT-LM
 cd LiteRT-LM
 git lfs pull                          # fetch prebuilt GPU dylibs
-bazel build //c:libengine_shared.dylib
+./scripts/build_engine_shared.sh      # build for macos_arm64 / ios_arm64 / ios_sim_arm64
 ```
 
 > The target is a `cc_binary(linkshared=True)`, not `cc_shared_library`.

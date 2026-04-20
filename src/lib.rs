@@ -137,6 +137,55 @@ impl fmt::Display for Response {
 // Engine
 // ============================================================================
 
+/// Activation data type for GPU inference.
+///
+/// Lower precision reduces memory usage during model compilation and inference,
+/// at the cost of reduced numerical accuracy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ActivationDataType {
+    F32 = 0,
+    F16 = 1,
+    I16 = 2,
+    I8 = 3,
+}
+
+/// Configuration options for engine creation.
+///
+/// Use with [`Engine::with_config`] to override defaults.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    /// Maximum number of tokens (context window size).
+    /// Defaults to the model's built-in value when `None`.
+    pub max_num_tokens: Option<i32>,
+    /// Activation data type for GPU inference.
+    /// Defaults to the engine's built-in value when `None` (typically F32).
+    /// Use `F16` on memory-constrained devices to halve activation memory.
+    pub activation_data_type: Option<ActivationDataType>,
+    /// Backend for the vision encoder. When `None`, defaults to GPU on Apple,
+    /// CPU elsewhere. Google's Gallery app uses GPU vision for Gemma 4.
+    pub vision_backend: Option<Backend>,
+    /// Directory for caching compiled shaders and XNNPACK weight caches.
+    /// Propagates to both main LLM and vision executors.
+    /// Critical on iOS: lets XNNPACK mmap weights from disk instead of malloc.
+    pub cache_dir: Option<String>,
+    /// Override the main LLM backend. When `None`, the platform default is used
+    /// (GPU on Apple/DYLD_LIBRARY_PATH, CPU otherwise).
+    pub backend: Option<Backend>,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            max_num_tokens: None,
+            activation_data_type: None,
+            vision_backend: None,
+            cache_dir: None,
+            backend: None,
+        }
+    }
+}
+
 /// Loads a model and serves as factory for [`Session`] and [`Conversation`].
 pub struct Engine {
     raw: *mut LiteRtLmEngine,
@@ -147,19 +196,31 @@ unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
 impl Engine {
-    /// Load a `.litertlm` model with GPU backend and vision support.
+    /// Load a `.litertlm` model with the platform-appropriate backend.
     ///
-    /// Uses GPU for inference, CPU for vision encoding, and no audio backend.
-    /// This is the recommended default for multimodal models.
+    /// - Apple (macOS / iOS): tries GPU (Metal) first, falls back to CPU
+    ///   if GPU engine creation fails.
+    /// - Other platforms: uses GPU only when `DYLD_LIBRARY_PATH` is set
+    ///   (indicating GPU libraries are available), otherwise CPU.
+    ///
+    /// Vision defaults to the same backend as the main LLM; audio is disabled.
     pub fn new(model_path: &str) -> Result<Self> {
-        let dyld_path = std::env::var("DYLD_LIBRARY_PATH");
+        Self::with_config(model_path, EngineConfig::default())
+    }
 
-        let backend = if dyld_path.is_ok() {
-            Backend::Gpu
-        } else {
-            Backend::Cpu
-        };
-        Self::create(model_path, backend, Some(Backend::Cpu), None)
+    /// Load a `.litertlm` model with platform-appropriate backend and custom config.
+    ///
+    /// See [`EngineConfig`] for available options.
+    pub fn with_config(model_path: &str, config: EngineConfig) -> Result<Self> {
+        let main_backend = config.backend.unwrap_or_else(|| {
+            if cfg!(target_vendor = "apple") || std::env::var("DYLD_LIBRARY_PATH").is_ok() {
+                Backend::Gpu
+            } else {
+                Backend::Cpu
+            }
+        });
+        let vision = Some(config.vision_backend.unwrap_or(main_backend));
+        Self::create(model_path, main_backend, vision, None, &config)
     }
 
     fn create(
@@ -167,6 +228,7 @@ impl Engine {
         backend: Backend,
         vision_backend: Option<Backend>,
         audio_backend: Option<Backend>,
+        config: &EngineConfig,
     ) -> Result<Self> {
         let path = to_cstring(model_path, "model path")?;
         let be = to_cstring(backend.as_str(), "backend")?;
@@ -186,6 +248,19 @@ impl Engine {
             );
             if settings.is_null() {
                 return Err(Error::new("Failed to create engine settings"));
+            }
+
+            if let Some(max_tokens) = config.max_num_tokens {
+                litert_lm_engine_settings_set_max_num_tokens(settings, max_tokens);
+            }
+
+            if let Some(adt) = config.activation_data_type {
+                litert_lm_engine_settings_set_activation_data_type(settings, adt as i32);
+            }
+
+            if let Some(ref dir) = config.cache_dir {
+                let dir_c = to_cstring(dir, "cache dir")?;
+                litert_lm_engine_settings_set_cache_dir(settings, dir_c.as_ptr());
             }
 
             let engine = litert_lm_engine_create(settings);
