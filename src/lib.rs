@@ -153,7 +153,7 @@ pub enum ActivationDataType {
 /// Configuration options for engine creation.
 ///
 /// Use with [`Engine::with_config`] to override defaults.
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct EngineConfig {
     /// Maximum number of tokens (context window size).
     /// Defaults to the model's built-in value when `None`.
@@ -172,18 +172,6 @@ pub struct EngineConfig {
     /// Override the main LLM backend. When `None`, the platform default is used
     /// (GPU on Apple/DYLD_LIBRARY_PATH, CPU otherwise).
     pub backend: Option<Backend>,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            max_num_tokens: None,
-            activation_data_type: None,
-            vision_backend: None,
-            cache_dir: None,
-            backend: None,
-        }
-    }
 }
 
 /// Loads a model and serves as factory for [`Session`] and [`Conversation`].
