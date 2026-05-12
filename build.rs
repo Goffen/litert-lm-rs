@@ -61,12 +61,7 @@ fn main() {
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_function("litert_lm_.*")
         .allowlist_type("LiteRtLm.*")
-        .allowlist_type("InputData.*")
-        .allowlist_var("kInput.*")
-        .allowlist_type("Type")
-        .allowlist_var("kType.*")
-        .allowlist_var("kTop.*")
-        .allowlist_var("kGreedy")
+        .allowlist_var("kLiteRtLm.*")
         .generate_comments(true);
 
     // Cross-compiling for iOS: tell clang the target and sysroot.

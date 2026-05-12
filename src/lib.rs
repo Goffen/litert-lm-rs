@@ -172,6 +172,10 @@ pub struct EngineConfig {
     /// Override the main LLM backend. When `None`, the platform default is used
     /// (GPU on Apple/DYLD_LIBRARY_PATH, CPU otherwise).
     pub backend: Option<Backend>,
+    /// Enable Multi-Token Prediction (MTP) via speculative decoding. Requires
+    /// a model that ships an MTP head (e.g. Gemma 4 E4B). When `None`, the
+    /// engine uses its default.
+    pub enable_speculative_decoding: Option<bool>,
 }
 
 /// Loads a model and serves as factory for [`Session`] and [`Conversation`].
@@ -251,6 +255,12 @@ impl Engine {
                 litert_lm_engine_settings_set_cache_dir(settings, dir_c.as_ptr());
             }
 
+            if let Some(enable) = config.enable_speculative_decoding {
+                litert_lm_engine_settings_set_enable_speculative_decoding(
+                    settings, enable,
+                );
+            }
+
             let engine = litert_lm_engine_create(settings);
             if engine.is_null() {
                 litert_lm_engine_settings_delete(settings);
@@ -304,8 +314,8 @@ impl Session {
         let prompt_cstr = to_cstring(prompt, "prompt")?;
 
         unsafe {
-            let input_data = InputData {
-                type_: InputDataType_kInputText,
+            let input_data = LiteRtLmInputData {
+                type_: LiteRtLmInputDataType_kLiteRtLmInputDataTypeText,
                 data: prompt_cstr.as_ptr() as *const std::ffi::c_void,
                 size: prompt.len(),
             };
@@ -429,16 +439,19 @@ impl Conversation {
             .transpose()?;
 
         unsafe {
-            let config = litert_lm_conversation_config_create(
-                engine.raw,
-                std::ptr::null(), // session_config
-                sys_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-                tools_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-                std::ptr::null(),     // messages_json
-                tools_json.is_some(), // enable constrained decoding when tools present
-            );
+            let config = litert_lm_conversation_config_create();
             if config.is_null() {
                 return Err(Error::new("Failed to create conversation config"));
+            }
+
+            if let Some(ref s) = sys_cstr {
+                litert_lm_conversation_config_set_system_message(config, s.as_ptr());
+            }
+            if let Some(ref t) = tools_cstr {
+                litert_lm_conversation_config_set_tools(config, t.as_ptr());
+                litert_lm_conversation_config_set_enable_constrained_decoding(
+                    config, true,
+                );
             }
 
             let raw = litert_lm_conversation_create(engine.raw, config);
