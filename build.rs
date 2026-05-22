@@ -18,14 +18,26 @@ fn litert_lm_candidates(manifest: &Path) -> Vec<PathBuf> {
 /// Map the Rust target triple to the prebuilt subdirectory.
 ///
 /// Prebuilt libraries are produced by `LiteRT-LM/scripts/build_engine_shared.sh`
-/// and live under `prebuilt/<platform>/libengine_shared.dylib`.
+/// (macOS / iOS) or `bazel build --config=android_arm64 //c:libengine_shared.dylib`
+/// (Android) and live under `prebuilt/<platform>/libengine_shared.{dylib,so}`.
 fn prebuilt_subdir(target: &str) -> &'static str {
     match target {
         t if t.contains("ios-sim") || t.contains("ios_sim") => "prebuilt/ios_sim_arm64",
         t if t.contains("ios") => "prebuilt/ios_arm64",
+        t if t.contains("aarch64-linux-android") => "prebuilt/android_arm64",
         t if t.contains("aarch64-apple-darwin") => "prebuilt/macos_arm64",
         // Fallback for other macOS hosts (x86_64) — would need its own prebuilt.
         _ => "prebuilt/macos_arm64",
+    }
+}
+
+/// Library file name for the engine on this target. Android uses ELF `.so`;
+/// every other supported target is Mach-O `.dylib`.
+fn engine_lib_name(target: &str) -> &'static str {
+    if target.contains("android") {
+        "libengine_shared.so"
+    } else {
+        "libengine_shared.dylib"
     }
 }
 
@@ -81,14 +93,40 @@ fn main() {
         }
     }
 
+    // Cross-compiling for Android: point bindgen's libclang at the NDK
+    // sysroot so it can find <stdint.h>, <stdbool.h>, etc. Honors
+    // ANDROID_NDK_HOME first, then NDK_HOME.
+    if target.contains("android") {
+        builder = builder.clang_arg(format!("--target={target}"));
+        let ndk = env::var("ANDROID_NDK_HOME")
+            .or_else(|_| env::var("NDK_HOME"))
+            .ok();
+        if let Some(ndk) = ndk {
+            // NDK r23+: prebuilt/<host>/sysroot. Detect host dir.
+            let toolchains = PathBuf::from(&ndk).join("toolchains/llvm/prebuilt");
+            if let Ok(read) = std::fs::read_dir(&toolchains) {
+                if let Some(host) = read
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .find(|p| p.is_dir())
+                {
+                    let sysroot = host.join("sysroot");
+                    if sysroot.exists() {
+                        builder = builder.clang_arg(format!("--sysroot={}", sysroot.display()));
+                    }
+                }
+            }
+        }
+    }
+
     let bindings = builder.generate().expect("Unable to generate bindings");
 
     PathBuf::from(env::var("OUT_DIR").unwrap())
         .join("bindings.rs")
         .pipe(|p| bindings.write_to_file(p).expect("Couldn't write bindings!"));
 
-    // ── Locate libengine_shared.dylib ───────────────────────────────────
-    let lib_name = "libengine_shared.dylib";
+    // ── Locate engine shared library ────────────────────────────────────
+    let lib_name = engine_lib_name(&target);
     let subdir = prebuilt_subdir(&target);
     let mut lib_dirs: Vec<PathBuf> = Vec::new();
 
@@ -109,21 +147,23 @@ fn main() {
 
     let mut found = false;
     for dir in &lib_dirs {
-        let dylib = dir.join(lib_name);
-        if dylib.exists() {
+        let lib_path = dir.join(lib_name);
+        if lib_path.exists() {
             let abs_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
             println!("cargo:rustc-link-search=native={}", abs_dir.display());
 
             // Patch install_name to absolute path on macOS host builds so the
-            // binary finds the dylib without DYLD_LIBRARY_PATH.
-            // iOS uses @rpath — do not patch.
-            if !target.contains("ios") {
-                let abs_dylib = abs_dir.join(lib_name);
+            // binary finds the dylib without DYLD_LIBRARY_PATH. iOS uses @rpath
+            // (set at engine build time). Android uses ELF + RUNPATH which the
+            // APK packaging handles via jniLibs — install_name_tool is Mach-O
+            // only and would just no-op anyway.
+            if !target.contains("ios") && !target.contains("android") {
+                let abs_lib = abs_dir.join(lib_name);
                 let _ = std::process::Command::new("chmod")
-                    .args(["u+w", &dylib.to_string_lossy()])
+                    .args(["u+w", &lib_path.to_string_lossy()])
                     .status();
                 let _ = std::process::Command::new("install_name_tool")
-                    .args(["-id", &abs_dylib.to_string_lossy(), &dylib.to_string_lossy()])
+                    .args(["-id", &abs_lib.to_string_lossy(), &lib_path.to_string_lossy()])
                     .status();
             }
 
@@ -138,7 +178,13 @@ fn main() {
     }
 
     println!("cargo:rustc-link-lib=dylib=engine_shared");
-    println!("cargo:rustc-link-lib=dylib=c++");
+    // C++ stdlib: NDK ships libc++_shared.so; Apple targets ship libc++.dylib.
+    let cxx = if target.contains("android") {
+        "c++_shared"
+    } else {
+        "c++"
+    };
+    println!("cargo:rustc-link-lib=dylib={cxx}");
 }
 
 /// Extension trait to avoid a temporary variable for write_to_file.
