@@ -489,8 +489,12 @@ impl Conversation {
         let cstr = to_cstring(json, "message json")?;
 
         unsafe {
-            let resp =
-                litert_lm_conversation_send_message(self.raw, cstr.as_ptr(), std::ptr::null());
+            let resp = litert_lm_conversation_send_message(
+                self.raw,
+                cstr.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
             if resp.is_null() {
                 return Err(Error::new("Failed to send message"));
             }
