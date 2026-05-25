@@ -145,6 +145,15 @@ fn main() {
         lib_dirs.push(d.join("bazel-bin/c"));
     }
 
+    // Re-run if any candidate path appears or disappears. Without this
+    // cargo caches the very first lookup result (including a "not found"
+    // warning + missing rustc-link-search) and never re-runs build.rs when
+    // the .so is staged later — a successful subsequent build silently
+    // re-emits the cached link error.
+    for dir in &lib_dirs {
+        println!("cargo:rerun-if-changed={}", dir.join(lib_name).display());
+    }
+
     let mut found = false;
     for dir in &lib_dirs {
         let lib_path = dir.join(lib_name);
@@ -157,14 +166,32 @@ fn main() {
             // (set at engine build time). Android uses ELF + RUNPATH which the
             // APK packaging handles via jniLibs — install_name_tool is Mach-O
             // only and would just no-op anyway.
+            //
+            // Idempotency matters: install_name_tool rewrites the dylib
+            // unconditionally, updating its mtime. With the rerun-if-changed
+            // lines above watching this same path, an unconditional patch
+            // would invalidate the build script fingerprint every build.
+            // Read the current `LC_ID_DYLIB` first and skip when it already
+            // matches.
             if !target.contains("ios") && !target.contains("android") {
                 let abs_lib = abs_dir.join(lib_name);
-                let _ = std::process::Command::new("chmod")
-                    .args(["u+w", &lib_path.to_string_lossy()])
-                    .status();
-                let _ = std::process::Command::new("install_name_tool")
-                    .args(["-id", &abs_lib.to_string_lossy(), &lib_path.to_string_lossy()])
-                    .status();
+                let want = abs_lib.to_string_lossy();
+                let current = std::process::Command::new("otool")
+                    .args(["-D", &lib_path.to_string_lossy()])
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    // `otool -D` prints "<path>:\n<install_name>".
+                    .and_then(|s| s.lines().nth(1).map(str::to_string))
+                    .unwrap_or_default();
+                if current.trim() != want {
+                    let _ = std::process::Command::new("chmod")
+                        .args(["u+w", &lib_path.to_string_lossy()])
+                        .status();
+                    let _ = std::process::Command::new("install_name_tool")
+                        .args(["-id", &want, &lib_path.to_string_lossy()])
+                        .status();
+                }
             }
 
             found = true;
