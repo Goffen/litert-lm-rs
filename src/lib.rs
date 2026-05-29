@@ -165,6 +165,12 @@ pub struct EngineConfig {
     /// Backend for the vision encoder. When `None`, defaults to GPU on Apple,
     /// CPU elsewhere. Google's Gallery app uses GPU vision for Gemma 4.
     pub vision_backend: Option<Backend>,
+    /// Backend for the audio encoder. When `None`, the audio modality is
+    /// disabled — multimodal messages with `{"type":"audio",...}` content
+    /// will fail. Set to `Some(Backend::Cpu)` (the safe default) or
+    /// `Some(main_backend)` to opt in. Required for Gemma 4 audio input
+    /// (ASR, translation, audio understanding).
+    pub audio_backend: Option<Backend>,
     /// Directory for caching compiled shaders and XNNPACK weight caches.
     /// Propagates to both main LLM and vision executors.
     /// Critical on iOS: lets XNNPACK mmap weights from disk instead of malloc.
@@ -212,7 +218,10 @@ impl Engine {
             }
         });
         let vision = Some(config.vision_backend.unwrap_or(main_backend));
-        Self::create(model_path, main_backend, vision, None, &config)
+        // Audio is opt-in — leaving `audio_backend` as `None` preserves the
+        // historical behaviour where the audio modality isn't loaded at all.
+        let audio = config.audio_backend;
+        Self::create(model_path, main_backend, vision, audio, &config)
     }
 
     fn create(
