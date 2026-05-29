@@ -41,30 +41,128 @@ fn engine_lib_name(target: &str) -> &'static str {
     }
 }
 
+/// Resolved location of an official LiteRT-LM xcframework slice for an
+/// Apple target. `engine.h` and the linkable binary both live in (or
+/// next to) the slice; we bind against the slice's own header so the
+/// generated FFI always matches the binary's ABI.
+struct AppleSlice {
+    /// Path to the slice's bundled `engine.h` for bindgen.
+    header: PathBuf,
+    /// Directory passed to the linker as a search path.
+    link_search: PathBuf,
+    /// Full path to the binary, linked via `-l` by absolute path because
+    /// the file names (`CLiteRTLM`, `CLiteRTLM_mac.dylib`) don't follow
+    /// the `lib<name>.dylib` convention `rustc-link-lib` expects.
+    binary: PathBuf,
+}
+
+/// Locate the vendored xcframeworks. `LITERT_LM_XCFRAMEWORK_DIR` overrides;
+/// otherwise look for `vendor/` next to the crate. Returns `None` when no
+/// xcframework is present so the legacy `libengine_shared` path still works
+/// (Android always takes the legacy path — the xcframework is Apple-only).
+fn xcframework_root(manifest: &Path) -> Option<PathBuf> {
+    if let Ok(d) = env::var("LITERT_LM_XCFRAMEWORK_DIR") {
+        let p = PathBuf::from(d);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let vendor = manifest.join("vendor");
+    if vendor.join("CLiteRTLM.xcframework").exists()
+        || vendor.join("CLiteRTLM_mac.xcframework").exists()
+    {
+        return Some(vendor);
+    }
+    None
+}
+
+/// Map an Apple target triple to its xcframework slice under `root`.
+/// Returns `None` for non-Apple targets (Android) or when the expected
+/// slice isn't present.
+fn apple_slice(root: &Path, target: &str) -> Option<AppleSlice> {
+    // macOS: a plain universal dylib (`CLiteRTLM_mac.dylib`), not a
+    // `.framework`. iOS device + simulator: `.framework` bundles.
+    if target.contains("apple-darwin") {
+        let slice = root
+            .join("CLiteRTLM_mac.xcframework/macos-arm64_x86_64");
+        let binary = slice.join("CLiteRTLM_mac.dylib");
+        let header = slice.join("Headers/engine.h");
+        if binary.exists() && header.exists() {
+            return Some(AppleSlice {
+                header,
+                link_search: slice.clone(),
+                binary,
+            });
+        }
+        return None;
+    }
+    if target.contains("ios") {
+        let slice_dir = if target.contains("sim") {
+            "ios-arm64_x86_64-simulator"
+        } else {
+            "ios-arm64"
+        };
+        let fw = root
+            .join("CLiteRTLM.xcframework")
+            .join(slice_dir)
+            .join("CLiteRTLM.framework");
+        let binary = fw.join("CLiteRTLM");
+        let header = fw.join("Headers/engine.h");
+        if binary.exists() && header.exists() {
+            return Some(AppleSlice {
+                header,
+                // For frameworks the search path is the dir *containing*
+                // the .framework, used with `-framework CLiteRTLM`.
+                link_search: fw.parent().unwrap().to_path_buf(),
+                binary,
+            });
+        }
+        return None;
+    }
+    None
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LITERT_LM_DIR");
     println!("cargo:rerun-if-env-changed=LITERT_LM_LIB_PATH");
+    println!("cargo:rerun-if-env-changed=LITERT_LM_XCFRAMEWORK_DIR");
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let target = env::var("TARGET").unwrap_or_default();
 
-    // ── Locate LiteRT-LM repo ───────────────────────────────────────────
+    // ── Decide engine source: official xcframework (Apple) vs legacy
+    //    bazel `libengine_shared` (Android, or fallback when no xcframework
+    //    is vendored). The xcframework is self-contained — engine + Gemma
+    //    constraint provider + Metal accelerator + Metal sampler are all
+    //    statically merged — so on Apple it replaces the whole 3-dylib +
+    //    dlopen dance. ──────────────────────────────────────────────────
+    let apple = xcframework_root(&manifest).and_then(|root| apple_slice(&root, &target));
+
+    // ── Locate LiteRT-LM repo (still needed for the legacy header/lib) ──
     let candidates = litert_lm_candidates(&manifest);
 
     // ── Header resolution ───────────────────────────────────────────────
-    let c_header = candidates
-        .iter()
-        .map(|d| d.join("c/engine.h"))
-        .find(|p| p.exists())
-        .unwrap_or_else(|| {
-            panic!(
-                "Could not find c/engine.h in any LiteRT-LM checkout.\n\
-                 Searched: {:?}\n\
-                 Set LITERT_LM_DIR to the LiteRT-LM repo root.",
-                candidates
-            );
-        });
+    // Prefer the xcframework slice's own engine.h so the bindings match the
+    // linked binary's ABI exactly. Fall back to the fork's c/engine.h.
+    let c_header = if let Some(ref slice) = apple {
+        slice.header.clone()
+    } else {
+        candidates
+            .iter()
+            .map(|d| d.join("c/engine.h"))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Could not find the LiteRT-LM C API header.\n\
+                     For Apple targets, vendor the official xcframeworks:\n\
+                     \x20   ./scripts/fetch_xcframeworks.sh\n\
+                     For Android / a source build, set LITERT_LM_DIR to a \
+                     LiteRT-LM checkout (searched: {:?}).",
+                    candidates
+                );
+            })
+    };
     println!("cargo:rerun-if-changed={}", c_header.display());
 
     // ── Bindgen ─────────────────────────────────────────────────────────
@@ -125,7 +223,57 @@ fn main() {
         .join("bindings.rs")
         .pipe(|p| bindings.write_to_file(p).expect("Couldn't write bindings!"));
 
-    // ── Locate engine shared library ────────────────────────────────────
+    // ── Link: xcframework (Apple) path ──────────────────────────────────
+    // Only `rustc-link-lib` / `rustc-link-search` propagate from a
+    // dependency build script to the dependent crate's final link;
+    // `rustc-link-arg` does NOT. So we link via lib/search (not an absolute
+    // -link-arg) and make runtime resolution work without an rpath
+    // (rpaths are link-args too, so they wouldn't propagate either).
+    if let Some(slice) = apple {
+        println!("cargo:rerun-if-changed={}", slice.binary.display());
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+        if target.contains("ios") {
+            // Frameworks link cleanly via -F<dir> + -framework, both of
+            // which propagate. The app bundle embeds CLiteRTLM.framework and
+            // sets its own @executable_path/Frameworks rpath at bundle time,
+            // so the framework's `@rpath/CLiteRTLM.framework/CLiteRTLM`
+            // install name resolves on device without anything here.
+            let search = slice
+                .link_search
+                .canonicalize()
+                .unwrap_or(slice.link_search);
+            println!("cargo:rustc-link-search=framework={}", search.display());
+            println!("cargo:rustc-link-lib=framework=CLiteRTLM");
+        } else {
+            // macOS: the slice is a bare `CLiteRTLM_mac.dylib`, but
+            // `rustc-link-lib=dylib=NAME` looks for `lib<NAME>.dylib`.
+            // Symlink it under OUT_DIR to satisfy that. We leave the dylib
+            // pristine (Google's signature + its `@rpath/CLiteRTLM_mac.dylib`
+            // install name — no patching, so no signature invalidation /
+            // SIGKILL). Runtime resolution of that `@rpath` is handled by an
+            // rpath that host binaries get from the workspace
+            // `.cargo/config.toml` (build-script `rustc-link-arg`s, incl.
+            // rpaths, do NOT propagate to the dependent crate's final link,
+            // so it can't be emitted here).
+            let binary = slice.binary.canonicalize().unwrap_or(slice.binary);
+            let link_dir = out_dir.join("clitertlm-link");
+            let _ = std::fs::create_dir_all(&link_dir);
+            let symlink = link_dir.join("libCLiteRTLM_mac.dylib");
+            let _ = std::fs::remove_file(&symlink);
+            std::os::unix::fs::symlink(&binary, &symlink)
+                .expect("failed to symlink CLiteRTLM_mac.dylib");
+            println!("cargo:rustc-link-search=native={}", link_dir.display());
+            println!("cargo:rustc-link-lib=dylib=CLiteRTLM_mac");
+        }
+        // libc++ and the system frameworks the engine uses (Metal, MetalKit,
+        // AVFoundation) are already LC_LOAD_DYLIBs inside the slice and come
+        // transitively; link libc++ explicitly to be safe.
+        println!("cargo:rustc-link-lib=dylib=c++");
+        return;
+    }
+
+    // ── Link: legacy bazel libengine_shared path (Android / fallback) ───
     let lib_name = engine_lib_name(&target);
     let subdir = prebuilt_subdir(&target);
     let mut lib_dirs: Vec<PathBuf> = Vec::new();

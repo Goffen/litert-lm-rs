@@ -4,19 +4,32 @@ Rust bindings for [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) -- Go
 
 ## Prerequisites
 
-### 1. Build the shared library
+### 1. Get the engine binaries
+
+**Apple (iOS / macOS) — recommended:** download Google's official
+prebuilt `CLiteRTLM` xcframeworks (self-contained C-API binaries; no fork,
+no bazel). They're gitignored (~165 MB), so a clean checkout runs this once:
+
+```bash
+./scripts/fetch_xcframeworks.sh       # → vendor/CLiteRTLM{,_mac}.xcframework
+```
+
+`build.rs` links these automatically on Apple targets.
+
+**Android / source build:** the engine still comes from a bazel build of
+`libengine_shared.so`:
 
 ```bash
 git clone https://github.com/google-ai-edge/LiteRT-LM
 cd LiteRT-LM
 git lfs pull                          # fetch prebuilt GPU dylibs
-./scripts/build_engine_shared.sh      # build for macos_arm64 / ios_arm64 / ios_sim_arm64
+./scripts/build_engine_shared.sh      # builds android_arm64 (+ Apple, if no xcframework)
 ```
 
-> The target is a `cc_binary(linkshared=True)`, not `cc_shared_library`.
-> `cc_shared_library` does not transitively link Rust static libraries
-> (the Jinja template engine is Rust via CXX bridge), leaving symbols
-> unresolved at runtime.
+> The bazel target is a `cc_binary(linkshared=True)`, not
+> `cc_shared_library`. `cc_shared_library` does not transitively link Rust
+> static libraries (the Jinja template engine is Rust via CXX bridge),
+> leaving symbols unresolved at runtime.
 
 ### 2. Download a model
 
@@ -35,10 +48,15 @@ Add to your `Cargo.toml`:
 litert-lm-rs = { path = "../litert-lm-rs" }
 ```
 
-`build.rs` automatically locates `libengine_shared.dylib` in a sibling
-`LiteRT-LM/` checkout, or via `LITERT_LM_DIR` / `LITERT_LM_LIB_PATH`
-environment variables. It patches the dylib's `install_name` to an
-absolute path so downstream binaries find it without rpath.
+`build.rs` selects the engine source per target:
+- **Apple**: links the vendored `CLiteRTLM` xcframework (framework on iOS,
+  `CLiteRTLM_mac.dylib` on macOS). The dylib is left pristine
+  (`@rpath/CLiteRTLM_mac.dylib`, Google's signature); host binaries
+  resolve it via an rpath in the consuming workspace's
+  `.cargo/config.toml` (build-script rpaths don't propagate to dependents).
+- **Android / fallback**: locates `libengine_shared.{so,dylib}` in a
+  sibling `LiteRT-LM/` checkout, or via `LITERT_LM_DIR` /
+  `LITERT_LM_LIB_PATH`.
 
 ### Conversation API (recommended)
 

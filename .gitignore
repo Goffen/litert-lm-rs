@@ -17,3 +17,6 @@ Thumbs.db
 litert_lm.rs
 
 default.profraw
+
+# xcframework binaries (large; download from LiteRT-LM v0.12.0 release)
+/vendor/
