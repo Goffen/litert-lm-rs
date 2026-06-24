@@ -15,7 +15,7 @@
 #         ./scripts/fetch_xcframeworks.sh --force # re-download even if present
 set -euo pipefail
 
-VERSION="v0.12.0"
+VERSION="v0.13.1"
 BASE="https://github.com/google-ai-edge/LiteRT-LM/releases/download/${VERSION}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,11 +26,11 @@ FORCE=0
 
 # zip | sha256 | extracted-dir-name
 IOS_ZIP="CLiteRTLM.xcframework.zip"
-IOS_SHA="3c2a11ecc8511d1e74efa7ca308dc7130c95223325c33212337ffb0563b79cde"
+IOS_SHA="7ff01c42106b754748b5dd3036a4a57161b25ebf523e705bebc1219061852362"
 IOS_DIR="CLiteRTLM.xcframework"
 
 MAC_ZIP="CLiteRTLM_mac.xcframework.zip"
-MAC_SHA="a8238da94b31ce0383e0fd52a0a729b9c18a1055170a995f0aa32056bd9822e5"
+MAC_SHA="ec9ffe230dc39117a7fc8933b1cc15910454027fee6d3041534ab7cf17313981"
 MAC_DIR="CLiteRTLM_mac.xcframework"
 
 mkdir -p "$VENDOR"
