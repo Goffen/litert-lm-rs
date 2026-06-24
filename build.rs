@@ -80,14 +80,16 @@ fn xcframework_root(manifest: &Path) -> Option<PathBuf> {
 /// Returns `None` for non-Apple targets (Android) or when the expected
 /// slice isn't present.
 fn apple_slice(root: &Path, target: &str) -> Option<AppleSlice> {
-    // macOS: a plain universal dylib (`CLiteRTLM_mac.dylib`), not a
-    // `.framework`. iOS device + simulator: `.framework` bundles.
     if target.contains("apple-darwin") {
         let slice = root
             .join("CLiteRTLM_mac.xcframework/macos-arm64_x86_64");
-        let binary = slice.join("CLiteRTLM_mac.dylib");
+        // v0.13.1 renamed the dylib to include the `lib` prefix.
+        let binary = ["libCLiteRTLM_mac.dylib", "CLiteRTLM_mac.dylib"]
+            .iter()
+            .map(|n| slice.join(n))
+            .find(|p| p.exists());
         let header = slice.join("Headers/engine.h");
-        if binary.exists() && header.exists() {
+        if let (Some(binary), true) = (binary, header.exists()) {
             return Some(AppleSlice {
                 header,
                 link_search: slice.clone(),
